@@ -1,0 +1,2194 @@
+diff --git a/mlx_lm/models/inkling2/__init__.py b/mlx_lm/models/inkling2/__init__.py
+index 2fdcd16..76795e0 100644
+--- a/mlx_lm/models/inkling2/__init__.py
++++ b/mlx_lm/models/inkling2/__init__.py
+@@ -7,8 +7,18 @@ https://huggingface.co/thinkingmachines/Inkling-2-Small
+ 
+ from mlx_lm.models.inkling2.config import ModelArgs
+ from mlx_lm.models.inkling2.model import Model
++from mlx_lm.models.inkling2.mtp import (
++    AdaptiveMTPController,
++    Inkling2DSparkConfig,
++    Inkling2DSparkDrafter,
++    Inkling2DSparkModel,
++)
+ 
+ __all__ = [
++    "AdaptiveMTPController",
++    "Inkling2DSparkConfig",
++    "Inkling2DSparkDrafter",
++    "Inkling2DSparkModel",
+     "Model",
+     "ModelArgs",
+ ]
+diff --git a/mlx_lm/models/inkling2/kernels.py b/mlx_lm/models/inkling2/kernels.py
+index 6279769..f37d0dd 100644
+--- a/mlx_lm/models/inkling2/kernels.py
++++ b/mlx_lm/models/inkling2/kernels.py
+@@ -6,7 +6,12 @@ from mlx_lm.kernels.common import row_threads, scalar
+ 
+ __all__ = [
+     "depth_attention",
++    "dynamic_conv",
++    "moe_short_conv",
++    "qkv_post",
+     "relative_attention",
++    "relative_attention_splitk",
++    "short_conv",
+ ]
+ 
+ 
+@@ -155,7 +160,11 @@ _RELATIVE_ATTENTION_SOURCE = """
+         if (row_ok) {
+             const device T* qp = q + batch * q_strides[0] + head * q_strides[1]
+                 + row * q_strides[2] + db * 8 + fn;
+-            qv = half2(float(qp[0]), float(qp[1]));
++            if constexpr (IS_BF16) {
++                qv = half2(float(qp[0]), float(qp[1]));
++            } else {
++                qv = half2(qp[0], qp[1]);
++            }
+         }
+         q_frag[db].thread_elements()[0] = qv.x;
+         q_frag[db].thread_elements()[1] = qv.y;
+@@ -193,8 +202,13 @@ _RELATIVE_ATTENTION_SOURCE = """
+                 vv[1] = vp[1];
+             }
+             for (int j = 0; j < 8; ++j) {
+-                Ks[(col + j) * LDK + r] = half(float(kv[j / 4][j % 4]));
+-                Vs[r * LDV + col + j] = half(float(vv[j / 4][j % 4]));
++                if constexpr (IS_BF16) {
++                    Ks[(col + j) * LDK + r] = half(float(kv[j / 4][j % 4]));
++                    Vs[r * LDV + col + j] = half(float(vv[j / 4][j % 4]));
++                } else {
++                    Ks[(col + j) * LDK + r] = kv[j / 4][j % 4];
++                    Vs[r * LDV + col + j] = vv[j / 4][j % 4];
++                }
+             }
+         }
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+@@ -288,7 +302,7 @@ def relative_attention(
+     window: int,
+     key_start: mx.array,
+ ) -> mx.array:
+-    """q: (B, Hq, L, D), k and v: (B, Hkv, S, D), all bfloat16, with the queries
++    """q: (B, Hq, L, D), k and v: (B, Hkv, S, D), all bfloat16 or float16, with the queries
+     at the last L keys. rel: (B, L, Hq, R), the bias at distances below R.
+     sinks: (B, L, Hq). key_start: (B,), the first key of each row. Returns
+     (B, L, Hq, D)."""
+@@ -307,6 +321,7 @@ def relative_attention(
+         ],
+         template=[
+             ("T", q.dtype),
++            ("IS_BF16", int(q.dtype == mx.bfloat16)),
+             ("D", D),
+             ("HQ", Hq),
+             ("HKV", Hkv),
+@@ -320,3 +335,713 @@ def relative_attention(
+         output_shapes=[(B, L, Hq, D)],
+         output_dtypes=[q.dtype],
+     )[0]
++
++
++_SHORT_CONV_HEADER = """
++template <typename T, typename S, typename X>
++inline float inkling2_padded(
++    const device S* srow, int64_t ss,
++    const device X* xrow, int64_t xs,
++    int P, int idx
++) {
++    if (idx < P) {
++        return float(T(srow[idx * ss]));
++    }
++    return float(T(xrow[(idx - P) * xs]));
++}
++
++template <typename T, typename S, typename X>
++inline float inkling2_padded_raw(
++    const device S* srow, int64_t ss,
++    const device X* xrow, int64_t xs,
++    int P, int idx
++) {
++    if (idx < P) {
++        return float(srow[idx * ss]);
++    }
++    return float(xrow[(idx - P) * xs]);
++}
++
++template <typename T, typename S, typename X>
++inline float inkling2_moe_padded(
++    const device S* srow, int64_t ss,
++    const device X* zcol, const device float* wt,
++    int C, int KE, int P, int idx
++) {
++    if (idx < P) {
++        return float(srow[idx * ss]);
++    }
++    const int t = idx - P;
++    const device X* zt = zcol + (size_t)t * KE * C;
++    const device float* w = wt + (size_t)t * KE;
++    float sum = 0.0f;
++    for (int e = 0; e < KE; ++e) {
++        sum += float(zt[(size_t)e * C]) * w[e];
++    }
++    return float(T(sum));
++}
++"""
++
++_SHORT_CONV_SOURCE = """
++    constexpr int P = K - 1;
++    const int c = thread_position_in_grid.x;
++    const int t = thread_position_in_grid.y;
++    const int b = thread_position_in_grid.z;
++    const int L = x_shape[1];
++    const int C = x_shape[2];
++    const device S* srow = state + b * state_strides[0] + c * state_strides[2];
++    const device X* xrow = x + b * x_strides[0] + c * x_strides[2];
++    const int64_t ss = state_strides[1];
++    const int64_t xs = x_strides[1];
++
++    const device W* wrow = weight + c * weight_strides[0];
++    const int64_t ws = weight_strides[1];
++    float acc = 0.0f;
++    for (int j = 0; j < K; ++j) {
++        acc += float(wrow[j * ws]) * inkling2_padded<T>(srow, ss, xrow, xs, P, t + j);
++    }
++    const float own = inkling2_padded_raw<T>(srow, ss, xrow, xs, P, t + P);
++    const float conv = float(W(acc));
++    float val = float(T((conv + own) * inv_scale));
++    if (HAS_RESIDUAL) {
++        val = float(residual[b * residual_strides[0] + t * residual_strides[1]
++                             + c * residual_strides[2]]) + val;
++    }
++    out[((size_t)b * L + t) * C + c] = O(val);
++
++    if (t == L - 1) {
++        device float* st_out = next_state + ((size_t)b * P) * C + c;
++        for (int i = 0; i < P; ++i) {
++            st_out[i * C] = inkling2_padded_raw<T>(srow, ss, xrow, xs, P, L + i);
++        }
++    }
++"""
++
++_short_conv_kernel = mx.fast.metal_kernel(
++    name="inkling2_short_conv_v2",
++    input_names=["x", "state", "weight", "residual", "inv_scale"],
++    output_names=["out", "next_state"],
++    header=_SHORT_CONV_HEADER,
++    source=_SHORT_CONV_SOURCE,
++    ensure_row_contiguous=False,
++)
++
++
++def short_conv(
++    x: mx.array,
++    state: mx.array | None,
++    weight: mx.array,
++    inv_scale: float,
++    *,
++    residual: mx.array | None = None,
++    out_dtype: mx.Dtype | None = None,
++) -> tuple[mx.array, mx.array]:
++    """Fused causal depthwise short convolution + residual + state update for any L >= 1."""
++    B, L, C = x.shape
++    w = weight.reshape(C, -1)
++    K = w.shape[1]
++    P = K - 1
++    if state is None:
++        state = mx.zeros((B, P, C), dtype=mx.float32)
++    has_residual = residual is not None
++    res_in = residual if has_residual else x
++    o_dtype = out_dtype if out_dtype is not None else x.dtype
++    return _short_conv_kernel(
++        inputs=[x, state, w, res_in, scalar(inv_scale)],
++        template=[
++            ("T", x.dtype),
++            ("X", x.dtype),
++            ("W", w.dtype),
++            ("S", state.dtype),
++            ("O", o_dtype),
++            ("K", K),
++            ("HAS_RESIDUAL", has_residual),
++        ],
++        grid=(C, L, B),
++        threadgroup=(min(256, C), 1, 1),
++        output_shapes=[(B, L, C), (B, P, C)],
++        output_dtypes=[o_dtype, mx.float32],
++    )
++
++
++_MOE_SHORT_CONV_SOURCE = """
++    constexpr int P = K - 1;
++    const int c = thread_position_in_grid.x;
++    const int t = thread_position_in_grid.y;
++    const int b = thread_position_in_grid.z;
++    const int L = z_shape[1];
++    const int C = z_shape[3];
++    const device S* srow = state + b * state_strides[0] + c * state_strides[2];
++    const int64_t ss = state_strides[1];
++    const device X* zcol = z + (size_t)b * L * KE * C + c;
++    const device float* wt = moe_w + (size_t)b * L * KE;
++
++    const device W* wrow = weight + c * weight_strides[0];
++    const int64_t ws = weight_strides[1];
++    float acc = 0.0f;
++    float own = 0.0f;
++    for (int j = 0; j < K; ++j) {
++        const float xj = inkling2_moe_padded<T>(srow, ss, zcol, wt, C, KE, P, t + j);
++        acc += float(wrow[j * ws]) * float(T(xj));
++        if (j == P) {
++            own = xj;
++        }
++    }
++    const float conv = float(W(acc));
++    float val = float(T((conv + own) * inv_scale));
++    val = float(residual[b * residual_strides[0] + t * residual_strides[1]
++                         + c * residual_strides[2]]) + val;
++    out[((size_t)b * L + t) * C + c] = O(val);
++
++    if (t == L - 1) {
++        device float* st_out = next_state + ((size_t)b * P) * C + c;
++        for (int i = 0; i < P; ++i) {
++            st_out[i * C] = inkling2_moe_padded<T>(srow, ss, zcol, wt, C, KE, P, L + i);
++        }
++    }
++"""
++
++_moe_short_conv_kernel = mx.fast.metal_kernel(
++    name="inkling2_moe_short_conv",
++    input_names=["z", "moe_w", "state", "weight", "residual", "inv_scale"],
++    output_names=["out", "next_state"],
++    header=_SHORT_CONV_HEADER,
++    source=_MOE_SHORT_CONV_SOURCE,
++    ensure_row_contiguous=False,
++)
++
++
++def moe_short_conv(
++    z: mx.array,
++    moe_weights: mx.array,
++    state: mx.array | None,
++    weight: mx.array,
++    residual: mx.array,
++    inv_scale: float,
++    *,
++    dtype: mx.Dtype,
++) -> tuple[mx.array, mx.array]:
++    """Fused MoE weighted expert reduction + post-MLP short conv + block residual add."""
++    B, L, KE, C = z.shape
++    w = weight.reshape(C, -1)
++    K = w.shape[1]
++    P = K - 1
++    if state is None:
++        state = mx.zeros((B, P, C), dtype=mx.float32)
++    return _moe_short_conv_kernel(
++        inputs=[
++            mx.contiguous(z),
++            mx.contiguous(moe_weights.astype(mx.float32)),
++            state,
++            w,
++            residual,
++            scalar(inv_scale),
++        ],
++        template=[
++            ("T", dtype),
++            ("X", z.dtype),
++            ("W", w.dtype),
++            ("S", state.dtype),
++            ("O", dtype),
++            ("K", K),
++            ("KE", KE),
++        ],
++        grid=(C, L, B),
++        threadgroup=(min(256, C), 1, 1),
++        output_shapes=[(B, L, C), (B, P, C)],
++        output_dtypes=[dtype, mx.float32],
++    )
++
++
++_DYNAMIC_CONV_SOURCE = """
++    constexpr int P = K - 1;
++    const int c = thread_position_in_grid.x;
++    const int t = thread_position_in_grid.y;
++    const int b = thread_position_in_grid.z;
++    const int L = x_shape[1];
++    const int C = x_shape[2];
++    const device S* srow = state + b * state_strides[0] + c * state_strides[2];
++    const device T* xrow = x + b * x_strides[0] + c * x_strides[2];
++    const int64_t ss = state_strides[1];
++    const int64_t xs = x_strides[1];
++
++    const int head = c / (C / H);
++    const device DYN* drow = dyn + b * dyn_strides[0] + t * dyn_strides[1]
++        + head * K * dyn_strides[2];
++    const int64_t ds = dyn_strides[2];
++
++    float acc = 0.0f;
++    for (int lag = 0; lag < K; ++lag) {
++        const float sw = float(static_w[lag * static_w_strides[0] + c * static_w_strides[1]]);
++        const float tap = sw + float(drow[lag * ds]);
++        acc += inkling2_padded_raw<T>(srow, ss, xrow, xs, P, t + P - lag) * tap;
++    }
++    const float own = inkling2_padded_raw<T>(srow, ss, xrow, xs, P, t + P);
++    out[((size_t)b * L + t) * C + c] = T((acc + own) * inv_scale);
++
++    if (t == L - 1) {
++        device float* st_out = next_state + ((size_t)b * P) * C + c;
++        for (int i = 0; i < P; ++i) {
++            st_out[i * C] = inkling2_padded_raw<T>(srow, ss, xrow, xs, P, L + i);
++        }
++    }
++"""
++
++_dynamic_conv_kernel = mx.fast.metal_kernel(
++    name="inkling2_dynamic_conv",
++    input_names=["x", "dyn", "static_w", "state", "inv_scale"],
++    output_names=["out", "next_state"],
++    header=_SHORT_CONV_HEADER,
++    source=_DYNAMIC_CONV_SOURCE,
++    ensure_row_contiguous=False,
++)
++
++
++def dynamic_conv(
++    x: mx.array,
++    dyn: mx.array,
++    static_w: mx.array,
++    state: mx.array | None,
++    num_heads: int,
++    inv_scale: float,
++) -> tuple[mx.array, mx.array]:
++    """Fused dynamic causal short convolution + residual + state update for full attention."""
++    B, L, C = x.shape
++    K = static_w.shape[0]
++    P = K - 1
++    if state is None:
++        state = mx.zeros((B, P, C), dtype=mx.float32)
++    return _dynamic_conv_kernel(
++        inputs=[x, dyn, static_w, state, scalar(inv_scale)],
++        template=[
++            ("T", x.dtype),
++            ("DYN", dyn.dtype),
++            ("S", state.dtype),
++            ("K", K),
++            ("H", num_heads),
++        ],
++        grid=(C, L, B),
++        threadgroup=(min(256, C), 1, 1),
++        output_shapes=[(B, L, C), (B, P, C)],
++        output_dtypes=[x.dtype, mx.float32],
++    )
++
++
++# Fused Q/K/V/R post-projection epilogue:
++#   q -> ScaledL2Clip (+ optional tau) -> head-major (B, Hq, L, D)
++#   k -> L2Clip                        -> head-major (B, Hkv, L, D)
++#   v -> unweighted_rms_norm           -> head-major (B, Hkv, L, D)
++#   r -> ScaledL2Clip (+ optional tau) -> token-major (B, L, Hq, R)
++# One 32-thread simdgroup per head/task per token (assumes D == 128).
++_QKV_POST_SOURCE = """
++    const uint lane = thread_index_in_simdgroup;
++    const uint task = threadgroup_position_in_grid.x;
++    const uint row = threadgroup_position_in_grid.y;
++    const int L = q_shape[1];
++    const int b = row / L;
++    const int t = row % L;
++
++    if (task < HQ + HKV) {
++        const bool is_q = task < HQ;
++        const int head = is_q ? int(task) : int(task) - HQ;
++        const int col = head * D + int(lane) * 4;
++        float xf[4];
++        if (is_q) {
++            const device T* src = q + b * q_strides[0] + t * q_strides[1];
++            const int64_t cs = q_strides[2];
++            for (int i = 0; i < 4; ++i) {
++                xf[i] = float(src[(col + i) * cs]) * float(q_scale[col + i]);
++            }
++        } else {
++            const device T* src = k + b * k_strides[0] + t * k_strides[1];
++            const int64_t cs = k_strides[2];
++            for (int i = 0; i < 4; ++i) {
++                xf[i] = float(src[(col + i) * cs]);
++            }
++        }
++        float acc = 0.0f;
++        for (int i = 0; i < 4; ++i) {
++            acc += xf[i] * xf[i];
++        }
++        const float norm = metal::precise::sqrt(simd_sum(acc));
++        const float f = metal::min(params[0] / (norm + 1e-6f), 1.0f);
++        const int heads = is_q ? HQ : HKV;
++        device T* dst = (is_q ? qo : ko)
++            + (((size_t)b * heads + head) * L + t) * D + lane * 4;
++        const float tau_v = (HAS_TAU && is_q)
++            ? float(tau[b * tau_strides[0] + t * tau_strides[1]])
++            : 1.0f;
++        for (int i = 0; i < 4; ++i) {
++            T o = T(xf[i] * f);
++            if (HAS_TAU && is_q) {
++                o = T(float(o) * tau_v);
++            }
++            dst[i] = o;
++        }
++    } else if (task < HQ + 2 * HKV) {
++        const int head = int(task) - HQ - HKV;
++        const int col = head * D + int(lane) * 4;
++        const device T* src = v + b * v_strides[0] + t * v_strides[1];
++        const int64_t cs = v_strides[2];
++        float xv[4];
++        float acc = 0.0f;
++        for (int i = 0; i < 4; ++i) {
++            xv[i] = float(src[(col + i) * cs]);
++            acc = metal::fma(xv[i], xv[i], acc);
++        }
++        const float mean_sq = simd_sum(acc) / float(D);
++        const float inv = metal::precise::rsqrt(mean_sq + params[2]);
++        device T* dst = vo + (((size_t)b * HKV + head) * L + t) * D + lane * 4;
++        for (int i = 0; i < 4; ++i) {
++            dst[i] = T(xv[i] * inv);
++        }
++    } else {
++        const int head = (int(task) - HQ - 2 * HKV) * 32 + int(lane);
++        if (head >= HQ) {
++            return;
++        }
++        const device T* src = r + b * r_strides[0] + t * r_strides[1];
++        const int64_t cs = r_strides[2];
++        float xf[R];
++        float acc = 0.0f;
++        for (int j = 0; j < R; ++j) {
++            xf[j] = float(src[(head * R + j) * cs]) * float(r_scale[head * R + j]);
++            acc += xf[j] * xf[j];
++        }
++        const float norm = metal::precise::sqrt(acc);
++        const float f = metal::min(params[1] / (norm + 1e-6f), 1.0f);
++        device T* dst = ro + ((size_t)row * HQ + head) * R;
++        const float tau_v = HAS_TAU
++            ? float(tau[b * tau_strides[0] + t * tau_strides[1]])
++            : 1.0f;
++        for (int j = 0; j < R; ++j) {
++            T o = T(xf[j] * f);
++            if (HAS_TAU) {
++                o = T(float(o) * tau_v);
++            }
++            dst[j] = o;
++        }
++    }
++"""
++
++_qkv_post_kernel = mx.fast.metal_kernel(
++    name="inkling2_qkv_post",
++    input_names=["q", "k", "v", "r", "q_scale", "r_scale", "tau", "params"],
++    output_names=["qo", "ko", "vo", "ro"],
++    source=_QKV_POST_SOURCE,
++    ensure_row_contiguous=False,
++)
++
++
++def qkv_post(
++    q: mx.array,
++    k: mx.array,
++    v: mx.array,
++    r: mx.array,
++    q_scale: mx.array,
++    r_scale: mx.array,
++    qk_clip: float,
++    r_clip: float,
++    eps: float,
++    tau: mx.array | None,
++    num_heads: int,
++    num_kv_heads: int,
++) -> tuple[mx.array, mx.array, mx.array, mx.array]:
++    """Fused Q/K/R L2-clip + V unit RMSNorm + optional tau + head-major transpose."""
++    B, L, q_dim = q.shape
++    D = q_dim // num_heads
++    R = r.shape[-1] // num_heads
++    assert D == 128
++    has_tau = tau is not None
++    tau_in = (
++        mx.broadcast_to(tau.reshape(-1, L), (B, L)).astype(mx.float32)
++        if has_tau
++        else mx.zeros((1, 1), dtype=mx.float32)
++    )
++    tasks = num_heads + 2 * num_kv_heads + (num_heads + 31) // 32
++    params = mx.array([qk_clip, r_clip, eps], dtype=mx.float32)
++    return _qkv_post_kernel(
++        inputs=[
++            q,
++            k,
++            v,
++            r,
++            mx.contiguous(q_scale.reshape(-1).astype(mx.float32)),
++            mx.contiguous(r_scale.reshape(-1).astype(mx.float32)),
++            tau_in,
++            params,
++        ],
++        template=[
++            ("T", q.dtype),
++            ("D", D),
++            ("HQ", num_heads),
++            ("HKV", num_kv_heads),
++            ("R", R),
++            ("HAS_TAU", has_tau),
++        ],
++        grid=(tasks * 32, B * L, 1),
++        threadgroup=(32, 1, 1),
++        output_shapes=[
++            (B, num_heads, L, D),
++            (B, num_kv_heads, L, D),
++            (B, num_kv_heads, L, D),
++            (B, L, num_heads, R),
++        ],
++        output_dtypes=[q.dtype, k.dtype, v.dtype, r.dtype],
++    )
++
++
++_RELATIVE_SPLITK_SOURCE = """
++    constexpr float LOG2E = 1.4426950408889634f;
++    const int L = sizes[0];
++    const int S = sizes[1];
++    const int rot_idx = sizes[2];
++    const int split = threadgroup_position_in_grid.x;
++    const int row_kv = threadgroup_position_in_grid.y;
++    const int row = row_kv / HKV;
++    const int kv_head = row_kv % HKV;
++    const int batch = threadgroup_position_in_grid.z;
++    const uint sg = simdgroup_index_in_threadgroup;
++    const uint lane = thread_index_in_simdgroup;
++    const int start = key_start[batch];
++    const float qscale = scale * LOG2E;
++
++    const int diag = S - L + row;
++    int first_key = WINDOW > 0 ? max(0, diag - WINDOW + 1) : 0;
++    first_key = max(first_key, start);
++    const int total_keys = max(0, diag - first_key + 1);
++    const int chunk = (total_keys + NS - 1) / NS;
++    const int k_start = first_key + split * chunk;
++    const int k_end = min(diag + 1, k_start + chunk);
++
++    float q_reg[G][4];
++    float m[G];
++    float l[G];
++    float acc[G][4];
++    for (int g = 0; g < G; ++g) {
++        const int head = kv_head * G + g;
++        const device T* qp = q + batch * q_strides[0] + head * q_strides[1]
++            + row * q_strides[2] + lane * 4;
++        q_reg[g][0] = float(qp[0]);
++        q_reg[g][1] = float(qp[1]);
++        q_reg[g][2] = float(qp[2]);
++        q_reg[g][3] = float(qp[3]);
++        if (split == 0 && sg == 0) {
++            m[g] = float(sinks[(batch * L + row) * HQ + head]) * LOG2E;
++            l[g] = 1.0f;
++        } else {
++            m[g] = -INFINITY;
++            l[g] = 0.0f;
++        }
++        acc[g][0] = 0.0f;
++        acc[g][1] = 0.0f;
++        acc[g][2] = 0.0f;
++        acc[g][3] = 0.0f;
++    }
++
++    const device T* k_head = k + batch * k_strides[0] + kv_head * k_strides[1];
++    const device T* v_head = v + batch * v_strides[0] + kv_head * v_strides[1];
++    const size_t rel_row_base = size_t(batch * L + row) * HQ;
++
++    for (int key = k_start + int(sg); key < k_end; key += 4) {
++        int phys_key = key + rot_idx;
++        if (phys_key >= S) {
++            phys_key -= S;
++        }
++        const device T* kp = k_head + phys_key * k_strides[2] + lane * 4;
++        const device T* vp = v_head + phys_key * v_strides[2] + lane * 4;
++        const float k0 = float(kp[0]);
++        const float k1 = float(kp[1]);
++        const float k2 = float(kp[2]);
++        const float k3 = float(kp[3]);
++        const float v0 = float(vp[0]);
++        const float v1 = float(vp[1]);
++        const float v2 = float(vp[2]);
++        const float v3 = float(vp[3]);
++        const int dist = diag - key;
++
++        for (int g = 0; g < G; ++g) {
++            const int head = kv_head * G + g;
++            const float dot = simd_sum(
++                q_reg[g][0] * k0 + q_reg[g][1] * k1
++                + q_reg[g][2] * k2 + q_reg[g][3] * k3
++            );
++            float s = dot * qscale;
++            if (dist < R) {
++                s += float(rel[(rel_row_base + head) * R + dist]) * LOG2E;
++            }
++            const float new_m = max(m[g], s);
++            const float factor = (m[g] > -INFINITY) ? fast::exp2(m[g] - new_m) : 0.0f;
++            const float p = fast::exp2(s - new_m);
++            l[g] = l[g] * factor + p;
++            acc[g][0] = acc[g][0] * factor + p * v0;
++            acc[g][1] = acc[g][1] * factor + p * v1;
++            acc[g][2] = acc[g][2] * factor + p * v2;
++            acc[g][3] = acc[g][3] * factor + p * v3;
++            m[g] = new_m;
++        }
++    }
++
++    threadgroup float tg_m[4][G];
++    threadgroup float tg_l[4][G];
++    threadgroup float tg_acc[4][G][D];
++    for (int g = 0; g < G; ++g) {
++        if (lane == 0) {
++            tg_m[sg][g] = m[g];
++            tg_l[sg][g] = l[g];
++        }
++        for (int i = 0; i < 4; ++i) {
++            tg_acc[sg][g][lane * 4 + i] = acc[g][i];
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    if (sg == 0) {
++        for (int g = 0; g < G; ++g) {
++            const float m_all = max(
++                max(tg_m[0][g], tg_m[1][g]),
++                max(tg_m[2][g], tg_m[3][g])
++            );
++            float l_all = 0.0f;
++            float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
++            for (int s = 0; s < 4; ++s) {
++                const float ms = tg_m[s][g];
++                const float ls = tg_l[s][g];
++                if (ls > 0.0f) {
++                    const float w = fast::exp2(ms - m_all);
++                    l_all += ls * w;
++                    o0 += tg_acc[s][g][lane * 4 + 0] * w;
++                    o1 += tg_acc[s][g][lane * 4 + 1] * w;
++                    o2 += tg_acc[s][g][lane * 4 + 2] * w;
++                    o3 += tg_acc[s][g][lane * 4 + 3] * w;
++                }
++            }
++            const int head = kv_head * G + g;
++            const size_t base_ml = (size_t(batch * L + row) * HQ + head) * NS + split;
++            if (lane == 0) {
++                partial_m[base_ml] = m_all;
++                partial_l[base_ml] = l_all;
++            }
++            device float* po = partial_out + base_ml * D + lane * 4;
++            po[0] = o0;
++            po[1] = o1;
++            po[2] = o2;
++            po[3] = o3;
++        }
++    }
++"""
++
++_RELATIVE_SPLITK_REDUCE_SOURCE = """
++    const int L = sizes[0];
++    const int row_h = threadgroup_position_in_grid.y;
++    const int row = row_h / HQ;
++    const int head = row_h % HQ;
++    const int batch = threadgroup_position_in_grid.z;
++    const uint lane = thread_index_in_simdgroup;
++    const size_t base_ml = (size_t(batch * L + row) * HQ + head) * NS;
++
++    float m_all = -INFINITY;
++    for (int s = 0; s < NS; ++s) {
++        m_all = max(m_all, partial_m[base_ml + s]);
++    }
++    float l_all = 0.0f;
++    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
++    for (int s = 0; s < NS; ++s) {
++        const float ls = partial_l[base_ml + s];
++        if (ls > 0.0f) {
++            const float w = fast::exp2(partial_m[base_ml + s] - m_all);
++            l_all += ls * w;
++            const device float* po = partial_out + (base_ml + s) * D + lane * 4;
++            o0 += po[0] * w;
++            o1 += po[1] * w;
++            o2 += po[2] * w;
++            o3 += po[3] * w;
++        }
++    }
++    device T* op = out + (size_t(batch * L + row) * HQ + head) * D + lane * 4;
++    const float inv_l = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;
++    op[0] = T(o0 * inv_l);
++    op[1] = T(o1 * inv_l);
++    op[2] = T(o2 * inv_l);
++    op[3] = T(o3 * inv_l);
++"""
++
++_relative_splitk_kernel = mx.fast.metal_kernel(
++    name="relative_attention_splitk",
++    input_names=["q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale"],
++    output_names=["partial_out", "partial_m", "partial_l"],
++    source=_RELATIVE_SPLITK_SOURCE,
++    ensure_row_contiguous=False,
++)
++
++_relative_splitk_reduce_kernel = mx.fast.metal_kernel(
++    name="relative_attention_splitk_reduce",
++    input_names=["partial_out", "partial_m", "partial_l", "sizes"],
++    output_names=["out"],
++    source=_RELATIVE_SPLITK_REDUCE_SOURCE,
++)
++
++
++def relative_attention_splitk(
++    q: mx.array,
++    k: mx.array,
++    v: mx.array,
++    rel: mx.array,
++    sinks: mx.array,
++    *,
++    scale: float,
++    window: int,
++    key_start: mx.array,
++    rot_idx: int | None = None,
++) -> mx.array:
++    """Split-K GQA causal relative attention with sinks for small L (D == 128)."""
++    B, Hq, L, D = q.shape
++    Hkv, S = k.shape[1], k.shape[2]
++    assert D == 128 and Hq % Hkv == 0
++    G = Hq // Hkv
++    eff = min(S, window) if window > 0 else S
++    if eff <= 128:
++        ns = 1
++    elif eff <= 1024:
++        ns = 4
++    elif eff <= 2560:
++        ns = 8
++    else:
++        ns = 16
++
++    r_idx = S if rot_idx is None else int(rot_idx)
++    sizes = mx.array([L, S, r_idx], dtype=mx.int32)
++    partial_out, partial_m, partial_l = _relative_splitk_kernel(
++        inputs=[
++            q,
++            k,
++            v,
++            mx.contiguous(rel),
++            mx.contiguous(sinks.astype(mx.float32)),
++            mx.contiguous(key_start.astype(mx.int32)),
++            sizes,
++            scalar(scale),
++        ],
++        template=[
++            ("T", q.dtype),
++            ("D", D),
++            ("HQ", Hq),
++            ("HKV", Hkv),
++            ("G", G),
++            ("R", rel.shape[-1]),
++            ("WINDOW", window),
++            ("NS", ns),
++        ],
++        grid=(ns * 128, Hkv * L, B),
++        threadgroup=(128, 1, 1),
++        output_shapes=[(B, L, Hq, ns, D), (B, L, Hq, ns), (B, L, Hq, ns)],
++        output_dtypes=[mx.float32, mx.float32, mx.float32],
++    )
++    return _relative_splitk_reduce_kernel(
++        inputs=[partial_out, partial_m, partial_l, sizes],
++        template=[("T", q.dtype), ("D", D), ("HQ", Hq), ("NS", ns)],
++        grid=(32, Hq * L, B),
++        threadgroup=(32, 1, 1),
++        output_shapes=[(B, L, Hq, D)],
++        output_dtypes=[q.dtype],
++    )[0]
+diff --git a/mlx_lm/models/inkling2/layers.py b/mlx_lm/models/inkling2/layers.py
+index 2b02203..661f50a 100644
+--- a/mlx_lm/models/inkling2/layers.py
++++ b/mlx_lm/models/inkling2/layers.py
+@@ -12,7 +12,15 @@ from mlx_lm.kernels.expert_routing import expert_routing
+ from mlx_lm.layers.moe import SwitchLinear, _gather_sort, _scatter_unsort
+ from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
+ from mlx_lm.models.inkling2.config import TextArgs
+-from mlx_lm.models.inkling2.kernels import depth_attention, relative_attention
++from mlx_lm.models.inkling2.kernels import (
++    depth_attention,
++    dynamic_conv,
++    moe_short_conv,
++    qkv_post,
++    relative_attention,
++    relative_attention_splitk,
++    short_conv,
++)
+ 
+ __all__ = [
+     "Attention",
+@@ -33,10 +41,49 @@ __all__ = [
+     "SoftcappedSwiGLU",
+     "SparseMoeBlock",
+     "TopKRouter",
++    "fuse_linears",
+     "unweighted_rms_norm",
+ ]
+ 
+ 
++def fuse_linears(modules: list[nn.Module]) -> nn.Module | None:
++    """Concatenate bias-free Linear or QuantizedLinear modules along output rows."""
++    if not modules:
++        return None
++    first = modules[0]
++    if all(isinstance(m, nn.QuantizedLinear) and "bias" not in m for m in modules):
++        gs, bits, mode = first.group_size, first.bits, first.mode
++        if not all(
++            m.group_size == gs and m.bits == bits and m.mode == mode
++            and m.weight.shape[1] == first.weight.shape[1]
++            for m in modules
++        ):
++            return None
++        in_dims = first.scales.shape[1] * gs
++        out_dims = sum(m.weight.shape[0] for m in modules)
++        ql = nn.QuantizedLinear(
++            in_dims, out_dims, bias=False, group_size=gs, bits=bits, mode=mode
++        )
++        ql.weight = mx.concatenate([m.weight for m in modules], axis=0)
++        ql.scales = mx.concatenate([m.scales for m in modules], axis=0)
++        if first.get("biases") is not None and all(m.get("biases") is not None for m in modules):
++            ql.biases = mx.concatenate([m.biases for m in modules], axis=0)
++        else:
++            ql.biases = None
++        mx.eval(ql.parameters())
++        return ql
++    if all(isinstance(m, nn.Linear) and "bias" not in m for m in modules):
++        in_dims = first.weight.shape[1]
++        if not all(m.weight.shape[1] == in_dims for m in modules):
++            return None
++        out_dims = sum(m.weight.shape[0] for m in modules)
++        lin = nn.Linear(in_dims, out_dims, bias=False)
++        lin.weight = mx.concatenate([m.weight for m in modules], axis=0)
++        mx.eval(lin.parameters())
++        return lin
++    return None
++
++
+ _ROUTER_SCORE_EPS = 1e-20
+ 
+ 
+@@ -44,6 +91,10 @@ def _use_kernels() -> bool:
+     return mx.default_device() == mx.gpu and mx.metal.is_available()
+ 
+ 
++_USE_SHORT_CONV_KERNEL = True
++_USE_SPLITK_ATTN_KERNEL = True
++
++
+ def unweighted_rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
+     return mx.fast.rms_norm(x, None, eps)
+ 
+@@ -130,14 +181,40 @@ class ShortConvolution(nn.Module):
+         hidden_states: mx.array,
+         conv_state: mx.array | None,
+         conv_mask: mx.array | None,
++        *,
++        return_window: bool = True,
++        residual: mx.array | None = None,
++        out_dtype: mx.Dtype | None = None,
+     ) -> tuple[mx.array, mx.array]:
+         K = self.kernel_size
+-        residual = hidden_states.astype(mx.float32)
++        if (
++            _USE_SHORT_CONV_KERNEL
++            and _use_kernels()
++            and conv_mask is None
++            and hidden_states.dtype in (mx.bfloat16, mx.float16)
++            and self.conv1d.weight.dtype == hidden_states.dtype
++        ):
++            out, next_state = short_conv(
++                hidden_states,
++                conv_state,
++                self.conv1d.weight,
++                1.0 / math.sqrt(K + 1),
++                residual=residual,
++                out_dtype=out_dtype,
++            )
++            if not return_window:
++                return out, next_state
++            return out, _conv_input(hidden_states, conv_state, None, K)
++        res_in = hidden_states.astype(mx.float32)
+         window = _conv_input(hidden_states, conv_state, conv_mask, K)
+         # As the reference, the conv runs in the weight dtype.
+         out = self.conv1d(window.astype(self.conv1d.weight.dtype))
+-        out = (out.astype(mx.float32) + residual) / math.sqrt(K + 1)
+-        return out.astype(hidden_states.dtype), window
++        out = ((out.astype(mx.float32) + res_in) / math.sqrt(K + 1)).astype(
++            hidden_states.dtype
++        )
++        if residual is not None:
++            out = residual.astype(mx.float32) + out.astype(mx.float32)
++        return out.astype(out_dtype or hidden_states.dtype), window
+ 
+ 
+ class DynamicShortConvolution(nn.Module):
+@@ -154,11 +231,31 @@ class DynamicShortConvolution(nn.Module):
+         dynamic_input: mx.array,
+         conv_state: mx.array | None,
+         conv_mask: mx.array | None,
++        *,
++        return_window: bool = True,
+     ) -> tuple[mx.array, mx.array]:
+         B, L, C = hidden_states.shape
+         K, H = self.kernel_size, self.num_heads
+-        dynamic_weights = self.weight_proj(dynamic_input).astype(mx.float32)
+-        dynamic_weights = dynamic_weights.reshape(B, L, H, 1, K)
++        dyn_raw = self.weight_proj(dynamic_input)
++        if (
++            _USE_SHORT_CONV_KERNEL
++            and _use_kernels()
++            and conv_mask is None
++            and hidden_states.dtype in (mx.bfloat16, mx.float16)
++            and self.static_weight.dtype == hidden_states.dtype
++        ):
++            out, next_state = dynamic_conv(
++                hidden_states,
++                dyn_raw,
++                self.static_weight,
++                conv_state,
++                H,
++                1.0 / math.sqrt(2 * K + 1),
++            )
++            if not return_window:
++                return out, next_state
++            return out, _conv_input(hidden_states, conv_state, None, K)
++        dynamic_weights = dyn_raw.astype(mx.float32).reshape(B, L, H, 1, K)
+         static_weights = self.static_weight.astype(mx.float32).T.reshape(H, -1, K)
+         weights = static_weights + dynamic_weights
+ 
+@@ -265,6 +362,18 @@ class Attention(nn.Module):
+         )
+         self.eps = args.rms_norm_eps
+ 
++    def _project_qrgs(
++        self, hidden_states: mx.array
++    ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
++        if getattr(self, "_qrgs_proj", None) is not None:
++            return mx.split(self._qrgs_proj(hidden_states), self._qrgs_splits, axis=-1)
++        return (
++            self.q_proj(hidden_states),
++            self.r_proj(hidden_states),
++            self.gate_proj(hidden_states),
++            self.sink_proj(hidden_states),
++        )
++
+     def _attend(
+         self,
+         hidden_states: mx.array,
+@@ -274,33 +383,63 @@ class Attention(nn.Module):
+         relative_states: mx.array,
+         cache: Any | None,
+         tau: mx.array | None = None,
++        gate: mx.array | None = None,
++        sinks: mx.array | None = None,
+     ) -> mx.array:
+         B, L, _ = hidden_states.shape
+-        gate = self.gate_proj(hidden_states)
+-        sinks = self.sink_proj(hidden_states)
+-
+-        query_states = query_states.reshape(B, L, self.num_heads, -1)
+-        key_states = key_states.reshape(B, L, self.num_key_value_heads, -1)
+-        value_states = value_states.reshape(B, L, self.num_key_value_heads, -1)
+-        relative_states = relative_states.reshape(B, L, self.num_heads, -1)
+-        query_states = self.q_l2_clip(query_states)
+-        key_states = self.k_l2_clip(key_states)
+-        value_states = unweighted_rms_norm(
+-            value_states.astype(mx.float32), self.eps
+-        ).astype(value_states.dtype)
+-        relative_states = self.rel_l2_clip(relative_states)
+-        if tau is not None:
+-            query_states = (query_states.astype(mx.float32) * tau).astype(
+-                query_states.dtype
+-            )
+-            relative_states = (relative_states.astype(mx.float32) * tau).astype(
+-                relative_states.dtype
++        if gate is None:
++            gate = self.gate_proj(hidden_states)
++        if sinks is None:
++            sinks = self.sink_proj(hidden_states)
++
++        if (
++            _USE_SHORT_CONV_KERNEL
++            and _use_kernels()
++            and self.head_dim == 128
++            and query_states.dtype in (mx.bfloat16, mx.float16)
++            and query_states.dtype
++            == key_states.dtype
++            == value_states.dtype
++            == relative_states.dtype
++        ):
++            query_states, key_states, value_states, relative_states = qkv_post(
++                query_states,
++                key_states,
++                value_states,
++                relative_states,
++                self.q_l2_clip.scale,
++                self.rel_l2_clip.scale,
++                self.q_l2_clip.threshold,
++                self.rel_l2_clip.threshold,
++                self.eps,
++                tau,
++                self.num_heads,
++                self.num_key_value_heads,
+             )
+-        position_bias = self.rel_logits_proj(relative_states)
+-
+-        query_states = query_states.transpose(0, 2, 1, 3)
+-        key_states = key_states.transpose(0, 2, 1, 3)
+-        value_states = value_states.transpose(0, 2, 1, 3)
++            position_bias = self.rel_logits_proj(relative_states)
++        else:
++            query_states = query_states.reshape(B, L, self.num_heads, -1)
++            key_states = key_states.reshape(B, L, self.num_key_value_heads, -1)
++            value_states = value_states.reshape(B, L, self.num_key_value_heads, -1)
++            relative_states = relative_states.reshape(B, L, self.num_heads, -1)
++            query_states = self.q_l2_clip(query_states)
++            key_states = self.k_l2_clip(key_states)
++            value_states = unweighted_rms_norm(
++                value_states.astype(mx.float32), self.eps
++            ).astype(value_states.dtype)
++            relative_states = self.rel_l2_clip(relative_states)
++            if tau is not None:
++                query_states = (query_states.astype(mx.float32) * tau).astype(
++                    query_states.dtype
++                )
++                relative_states = (relative_states.astype(mx.float32) * tau).astype(
++                    relative_states.dtype
++                )
++            position_bias = self.rel_logits_proj(relative_states)
++
++            query_states = query_states.transpose(0, 2, 1, 3)
++            key_states = key_states.transpose(0, 2, 1, 3)
++            value_states = value_states.transpose(0, 2, 1, 3)
+         if cache is not None:
+             key_states, value_states = cache.update_and_fetch(key_states, value_states)
+         attn_output = self._attention(
+@@ -315,19 +454,49 @@ class Attention(nn.Module):
+         B, _, L, _ = query.shape
+         S = key.shape[2]
+         end = cache.offset if cache is not None else L
+-        bf16 = query.dtype == key.dtype == value.dtype == mx.bfloat16
+-        if L > 1 and _use_kernels() and bf16:
+-            key_start = mx.broadcast_to(S - end, (B,))
+-            return relative_attention(
+-                query,
+-                key,
+-                value,
+-                position_bias,
+-                sinks,
+-                scale=self.scaling,
+-                window=self.sliding_window,
+-                key_start=key_start,
+-            )
++        half_or_bf16 = (
++            query.dtype == key.dtype == value.dtype
++            and query.dtype in (mx.bfloat16, mx.float16)
++        )
++        if _use_kernels() and half_or_bf16 and (L > 1 or B > 1):
++            if (
++                _USE_SPLITK_ATTN_KERNEL
++                and L <= 8
++                and self.head_dim == 128
++                and self.num_heads % self.num_key_value_heads == 0
++            ):
++                key_start = mx.broadcast_to(S - end, (B,))
++                rot_idx = (
++                    cache._idx
++                    if (
++                        L == 1
++                        and isinstance(cache, (RotatingKVCache, BatchRotatingKVCache))
++                    )
++                    else S
++                )
++                return relative_attention_splitk(
++                    query,
++                    key,
++                    value,
++                    position_bias,
++                    sinks,
++                    scale=self.scaling,
++                    window=self.sliding_window,
++                    key_start=key_start,
++                    rot_idx=rot_idx,
++                )
++            if L > 1:
++                key_start = mx.broadcast_to(S - end, (B,))
++                return relative_attention(
++                    query,
++                    key,
++                    value,
++                    position_bias,
++                    sinks,
++                    scale=self.scaling,
++                    window=self.sliding_window,
++                    key_start=key_start,
++                )
+ 
+         query_positions = _positions(end - L, L)
+         key_positions = _key_positions(cache, S, L, end)
+@@ -380,21 +549,31 @@ class SlidingAttention(Attention):
+         cache: Any | None,
+         conv_states: list,
+         conv_mask: mx.array | None,
++        return_window: bool = True,
+     ) -> mx.array:
+         kv_cache = cache[0] if cache is not None else None
+         key_states, conv_states[0] = self.k_sconv(
+-            self.k_proj(key_hidden_states), conv_states[0], conv_mask
++            self.k_proj(key_hidden_states),
++            conv_states[0],
++            conv_mask,
++            return_window=return_window,
+         )
+         value_states, conv_states[1] = self.v_sconv(
+-            self.v_proj(value_hidden_states), conv_states[1], conv_mask
++            self.v_proj(value_hidden_states),
++            conv_states[1],
++            conv_mask,
++            return_window=return_window,
+         )
++        query_states, relative_states, gate, sinks = self._project_qrgs(hidden_states)
+         return self._attend(
+             hidden_states,
+-            self.q_proj(hidden_states),
++            query_states,
+             key_states,
+             value_states,
+-            self.r_proj(hidden_states),
++            relative_states,
+             kv_cache,
++            gate=gate,
++            sinks=sinks,
+         )
+ 
+ 
+@@ -417,6 +596,7 @@ class FullAttention(Attention):
+         cache: Any | None,
+         conv_states: list,
+         conv_mask: mx.array | None,
++        return_window: bool = True,
+     ) -> mx.array:
+         kv_cache = cache[0] if cache is not None else None
+         key_states, conv_states[0] = self.k_sconv(
+@@ -424,12 +604,14 @@ class FullAttention(Attention):
+             key_hidden_states,
+             conv_states[0],
+             conv_mask,
++            return_window=return_window,
+         )
+         value_states, conv_states[1] = self.v_sconv(
+             self.v_proj(value_hidden_states),
+             value_hidden_states,
+             conv_states[1],
+             conv_mask,
++            return_window=return_window,
+         )
+ 
+         offset = kv_cache.offset if kv_cache is not None else 0
+@@ -437,14 +619,17 @@ class FullAttention(Attention):
+         tau = 1.0 + self.log_scaling_alpha * mx.log(
+             mx.maximum((position_ids + 1) / self.log_scaling_n_floor, 1.0)
+         )
++        query_states, relative_states, gate, sinks = self._project_qrgs(hidden_states)
+         return self._attend(
+             hidden_states,
+-            self.q_proj(hidden_states),
++            query_states,
+             key_states,
+             value_states,
+-            self.r_proj(hidden_states),
++            relative_states,
+             kv_cache,
+             tau=tau[..., None, None],
++            gate=gate,
++            sinks=sinks,
+         )
+ 
+ 
+@@ -519,6 +704,11 @@ class SparseMoeBlock(nn.Module):
+         self.experts = Experts(args)
+         self.sharding_group = None
+ 
++    def unreduced(self, hidden_states: mx.array) -> tuple[mx.array, mx.array]:
++        selected_experts, routing_weights = self.gate(hidden_states)
++        expert_states = self.experts(hidden_states, selected_experts)
++        return expert_states, routing_weights
++
+     def __call__(self, hidden_states: mx.array) -> mx.array:
+         group = self.sharding_group
+         if group is not None:
+@@ -576,8 +766,12 @@ class MessageGate(nn.Module):
+         )
+         states = self.down_proj(states.astype(self.down_proj.weight.dtype))
+         states = states.astype(mx.float32)
+-        forget_gate = mx.tanh(self.forget_gate_proj(states))
+-        message_gate = mx.tanh(self.message_gate_proj(states))
++        if getattr(self, "_gates_proj", None) is not None:
++            gates = mx.tanh(self._gates_proj(states))
++            forget_gate, message_gate = mx.split(gates, 2, axis=-1)
++        else:
++            forget_gate = mx.tanh(self.forget_gate_proj(states))
++            message_gate = mx.tanh(self.message_gate_proj(states))
+         return (1 - forget_gate) * hidden_states + message_gate * message
+ 
+ 
+@@ -632,6 +826,14 @@ class DecoderLayer(nn.Module):
+         dtype = hidden_states.dtype
+         conv = cache[1] if cache is not None else None
+         conv_states = list(conv.cache) if conv is not None else [None] * 4
++        return_window = (
++            conv is None
++            or conv.lengths is not None
++            or (
++                hidden_states.shape[1] > 1
++                and getattr(conv, "record_verify_windows", False)
++            )
++        )
+         block_residual = hidden_states
+         normed_residual = unweighted_rms_norm(block_residual.astype(mx.float32))
+ 
+@@ -639,40 +841,89 @@ class DecoderLayer(nn.Module):
+         if self.attention_input is not None:
+             attention_inputs = self.attention_input(block_states, normed_residual)
+         hidden_states = self._self_attention(
+-            hidden_states, attention_inputs, cache, conv_states, conv_mask, messages
+-        )
+-        hidden_states, conv_states[2] = self.post_attention_convolution(
+-            hidden_states, conv_states[2], conv_mask
++            hidden_states,
++            attention_inputs,
++            cache,
++            conv_states,
++            conv_mask,
++            messages,
++            return_window=return_window,
+         )
+-
+-        residual = hidden_states = hidden_states.astype(mx.float32)
+         if self.is_block_boundary:
++            hidden_states, conv_states[2] = self.post_attention_convolution(
++                hidden_states,
++                conv_states[2],
++                conv_mask,
++                return_window=return_window,
++                out_dtype=mx.float32,
++            )
++            residual = hidden_states
+             block = normed_residual[None]
+             if block_states is None:
+                 block_states = block
+             else:
+                 block_states = mx.concatenate([block_states, block])
+         else:
+-            residual = hidden_states = block_residual.astype(mx.float32) + hidden_states
++            hidden_states, conv_states[2] = self.post_attention_convolution(
++                hidden_states,
++                conv_states[2],
++                conv_mask,
++                return_window=return_window,
++                residual=block_residual,
++                out_dtype=mx.float32,
++            )
++            residual = hidden_states
+ 
+         normed_states = unweighted_rms_norm(hidden_states)
+         hidden_states = self.mlp_input(block_states, normed_states)[..., 0, :]
+         if messages is not None:
+             hidden_states = self.mlp_message_gate(hidden_states, messages[..., 3, :])
+-        hidden_states = self.mlp(
+-            self.post_attention_layernorm(hidden_states).astype(dtype)
+-        )
+-        hidden_states, conv_states[3] = self.post_mlp_convolution(
+-            hidden_states, conv_states[3], conv_mask
++        mlp_in = self.post_attention_layernorm(hidden_states).astype(dtype)
++        fused_moe_conv = (
++            _USE_SHORT_CONV_KERNEL
++            and _use_kernels()
++            and conv_mask is None
++            and not return_window
++            and self.mlp.sharding_group is None
++            and dtype in (mx.bfloat16, mx.float16)
++            and self.post_mlp_convolution.conv1d.weight.dtype == dtype
+         )
++        if fused_moe_conv:
++            expert_states, routing_weights = self.mlp.unreduced(mlp_in)
++            hidden_states, conv_states[3] = moe_short_conv(
++                expert_states,
++                routing_weights,
++                conv_states[3],
++                self.post_mlp_convolution.conv1d.weight,
++                residual,
++                1.0 / math.sqrt(self.post_mlp_convolution.kernel_size + 1),
++                dtype=dtype,
++            )
++        else:
++            hidden_states = self.mlp(mlp_in)
++            hidden_states, conv_states[3] = self.post_mlp_convolution(
++                hidden_states,
++                conv_states[3],
++                conv_mask,
++                return_window=return_window,
++                residual=residual,
++                out_dtype=dtype,
++            )
+ 
+         if conv is not None:
+             n = self.post_mlp_convolution.kernel_size - 1
++            if block_residual.shape[1] > 1 and getattr(
++                conv, "record_verify_windows", False
++            ):
++                conv._verify_windows = list(conv_states)
+             for i, window in enumerate(conv_states):
+-                conv[i] = _conv_state(window, conv.lengths, n)
++                conv[i] = (
++                    window
++                    if window.shape[1] == n
++                    else _conv_state(window, conv.lengths, n)
++                )
+             conv.advance(block_residual.shape[1])
+-        hidden_states = residual + hidden_states.astype(mx.float32)
+-        return hidden_states.astype(dtype), block_states
++        return hidden_states, block_states
+ 
+ 
+ class SlidingDecoderLayer(DecoderLayer):
+@@ -682,7 +933,14 @@ class SlidingDecoderLayer(DecoderLayer):
+         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+ 
+     def _self_attention(
+-        self, hidden_states, attention_inputs, cache, conv_states, conv_mask, messages
++        self,
++        hidden_states,
++        attention_inputs,
++        cache,
++        conv_states,
++        conv_mask,
++        messages,
++        return_window: bool = True,
+     ):
+         dtype = hidden_states.dtype
+         if attention_inputs is not None:
+@@ -697,6 +955,7 @@ class SlidingDecoderLayer(DecoderLayer):
+             cache=cache,
+             conv_states=conv_states,
+             conv_mask=conv_mask,
++            return_window=return_window,
+         )
+ 
+ 
+@@ -710,7 +969,14 @@ class FullDecoderLayer(DecoderLayer):
+         self.v_input_layernorm = nn.RMSNorm(args.hidden_size, eps=eps)
+ 
+     def _self_attention(
+-        self, hidden_states, attention_inputs, cache, conv_states, conv_mask, messages
++        self,
++        hidden_states,
++        attention_inputs,
++        cache,
++        conv_states,
++        conv_mask,
++        messages,
++        return_window: bool = True,
+     ):
+         dtype = hidden_states.dtype
+         if attention_inputs is None:
+diff --git a/mlx_lm/models/inkling2/model.py b/mlx_lm/models/inkling2/model.py
+index f860c2c..82d0490 100644
+--- a/mlx_lm/models/inkling2/model.py
++++ b/mlx_lm/models/inkling2/model.py
+@@ -18,6 +18,7 @@ from mlx_lm.models.inkling2.layers import (
+     MessageInput,
+     ShortConvolution,
+     SlidingDecoderLayer,
++    fuse_linears,
+     unweighted_rms_norm,
+ )
+ from mlx_lm.models.inkling2.vision import VisionModel
+@@ -30,6 +31,29 @@ __all__ = [
+ ]
+ 
+ 
++class SpeculativeRotatingKVCache(RotatingKVCache):
++    """RotatingKVCache with extra tail slack so MTP verification can trim rejected drafts."""
++
++    def is_trimmable(self) -> bool:
++        return True
++
++    def trim(self, n: int) -> int:
++        n = min(int(n), int(self.offset))
++        if n <= 0:
++            return 0
++        if self.keys is not None:
++            # Verify steps always have L > 1, so _update_concat left keys in temporal order.
++            if self._idx != self.keys.shape[2]:
++                self.keys = self._temporal_order(self.keys)
++                self.values = self._temporal_order(self.values)
++                self._idx = self.keys.shape[2]
++            self.keys = self.keys[..., :-n, :]
++            self.values = self.values[..., :-n, :]
++            self._idx = self.keys.shape[2]
++        self.offset -= n
++        return n
++
++
+ class TextModel(PipelineMixin, nn.Module):
+     def __init__(self, args: TextArgs):
+         super().__init__()
+@@ -71,12 +95,17 @@ class TextModel(PipelineMixin, nn.Module):
+             raise ValueError("Pipeline parallel does not support looped models.")
+         super().pipeline(group, split)
+ 
+-    def _run_loop(self, hidden_states, cache, conv_mask):
++    def _run_loop(self, hidden_states, cache, conv_mask, capture=None):
+         core = self.args.loop_core
+         caches = iter(cache)
++        visit = 0
+ 
+         def run(layers, hidden_states, block_states, bank=None):
++            nonlocal visit
+             for i, layer in enumerate(layers):
++                if capture is not None and visit in capture:
++                    capture[visit] = hidden_states
++                visit += 1
+                 messages = None if bank is None else self.message_input(bank, i)
+                 hidden_states, block_states = layer(
+                     hidden_states,
+@@ -107,6 +136,7 @@ class TextModel(PipelineMixin, nn.Module):
+         inputs: mx.array,
+         cache: list[Any] | None = None,
+         input_embeddings: mx.array | None = None,
++        capture: dict[int, mx.array | None] | None = None,
+     ) -> mx.array:
+         if input_embeddings is None:
+             input_embeddings = self.embed(inputs)
+@@ -129,13 +159,15 @@ class TextModel(PipelineMixin, nn.Module):
+             hidden_states, block_states = states[0].astype(dtype), states[1:]
+ 
+         if self.args.loop_config is None:
+-            for layer, c in zip(layers, cache):
++            for visit, (layer, c) in enumerate(zip(layers, cache)):
++                if capture is not None and visit in capture:
++                    capture[visit] = hidden_states
+                 hidden_states, block_states = layer(
+                     hidden_states, block_states, cache=c, conv_mask=conv_mask
+                 )
+         else:
+             hidden_states, block_states = self._run_loop(
+-                hidden_states, cache, conv_mask
++                hidden_states, cache, conv_mask, capture=capture
+             )
+ 
+         if rank != 0:
+@@ -152,6 +184,8 @@ class TextModel(PipelineMixin, nn.Module):
+             normed_states = unweighted_rms_norm(hidden_states.astype(mx.float32))
+             hidden_states = self.final_input(block_states, normed_states)[..., 0, :]
+             hidden_states = self.norm(hidden_states).astype(dtype)
++            if capture is not None and len(self.layer_visits) in capture:
++                capture[len(self.layer_visits)] = hidden_states
+ 
+         if size > 1:
+             batch = hidden_states.shape[0]
+@@ -224,12 +258,13 @@ class Model(nn.Module):
+         cache: list[Any] | None = None,
+         input_embeddings: mx.array | None = None,
+         pixel_values: mx.array | list[mx.array] | None = None,
++        capture: dict[int, mx.array | None] | None = None,
+     ) -> mx.array:
+         if pixel_values is not None:
+             assert input_embeddings is None, "Pass pixel_values or input_embeddings."
+             input_embeddings = self.embed_inputs(inputs, pixel_values=pixel_values)
+         hidden_states = self.model.language_model(
+-            inputs, cache=cache, input_embeddings=input_embeddings
++            inputs, cache=cache, input_embeddings=input_embeddings, capture=capture
+         )
+         logits = self.lm_head(hidden_states)
+         if self.sharding_group is not None:
+@@ -336,3 +371,70 @@ class Model(nn.Module):
+             )
+             for layer in self.model.language_model.layer_visits
+         ]
++
++    def make_speculative_cache(self) -> list[CacheList]:
++        window = self.args.text.sliding_window_size
++        # Add 16 tokens of slack above the sliding window so rolling back up to 7
++        # rejected drafts never loses any token within the active sliding window.
++        return [
++            CacheList(
++                (
++                    SpeculativeRotatingKVCache(max_size=window + 16)
++                    if isinstance(layer, SlidingDecoderLayer)
++                    else KVCache()
++                ),
++                ArraysCache(4),
++            )
++            for layer in self.model.language_model.layer_visits
++        ]
++
++    def rollback_speculative_cache(
++        self, cache: list[CacheList], accepted: int, num_drafts: int
++    ) -> None:
++        rejected = int(num_drafts) - int(accepted)
++        width = self.args.text.sconv_kernel_size - 1
++        keep = int(accepted) + 1
++        for entry in cache:
++            kv, conv = entry[0], entry[1]
++            windows = getattr(conv, "_verify_windows", None)
++            if rejected > 0:
++                if kv.trim(rejected) != rejected:
++                    raise RuntimeError(
++                        f"Failed to trim KV cache by {rejected} tokens"
++                    )
++                if windows is None:
++                    raise RuntimeError(
++                        "Verify rollback found no saved convolution windows"
++                    )
++                for slot, window in enumerate(windows):
++                    conv[slot] = mx.contiguous(window[:, keep : keep + width])
++            conv._verify_windows = None
++
++    def fuse_projections(self) -> None:
++        """Fuse Q/R/Gate/Sink and MessageGate projections post-load for lower dispatch overhead."""
++        for layer in self.model.language_model.layers:
++            attn = layer.self_attn
++            if getattr(attn, "_qrgs_proj", None) is None:
++                projs = [attn.q_proj, attn.r_proj, attn.gate_proj, attn.sink_proj]
++                fused = fuse_linears(projs)
++                if fused is not None:
++                    dims = [p.weight.shape[0] for p in projs]
++                    attn._qrgs_proj = fused
++                    attn._qrgs_splits = (
++                        dims[0],
++                        dims[0] + dims[1],
++                        dims[0] + dims[1] + dims[2],
++                    )
++                    del attn.q_proj, attn.r_proj, attn.gate_proj, attn.sink_proj
++            for gate_name in (
++                "q_message_gate",
++                "k_message_gate",
++                "v_message_gate",
++                "mlp_message_gate",
++            ):
++                mg = getattr(layer, gate_name, None)
++                if mg is not None and getattr(mg, "_gates_proj", None) is None:
++                    fused = fuse_linears([mg.forget_gate_proj, mg.message_gate_proj])
++                    if fused is not None:
++                        mg._gates_proj = fused
++                        del mg.forget_gate_proj, mg.message_gate_proj
+diff --git a/mlx_lm/models/inkling2/mtp.py b/mlx_lm/models/inkling2/mtp.py
+new file mode 100644
+index 0000000..35db8d6
+--- /dev/null
++++ b/mlx_lm/models/inkling2/mtp.py
+@@ -0,0 +1,610 @@
++# Copyright © 2026 Apple Inc.
++
++"""DSpark Multi-Token Prediction (MTP) speculative drafter for Inkling 2."""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++import mlx.core as mx
++import mlx.nn as nn
++
++from mlx_lm.models.inkling2.layers import fuse_linears
++
++DRAFT_FILENAME = "mtp.safetensors"
++
++
++@dataclass
++class Inkling2DSparkConfig:
++    hidden_size: int
++    num_hidden_layers: int
++    num_attention_heads: int
++    num_key_value_heads: int
++    head_dim: int
++    intermediate_size: int
++    rms_norm_eps: float
++    rope_theta: float
++    sliding_window: int
++    block_size: int
++    markov_rank: int
++    target_layer_ids: list[int]
++    vocab_size: int
++    unpadded_vocab_size: int
++    final_logit_softcapping: float
++
++    @classmethod
++    def from_target_config(cls, config: dict) -> Inkling2DSparkConfig:
++        text = config["text_config"]
++        mtp = config["mtp_config"]
++        if mtp.get("q_bias") or mtp.get("o_bias"):
++            raise ValueError("Inkling 2 DSpark does not support projection biases.")
++        if mtp.get("markov_head_type") != "rnn_hidden":
++            raise ValueError(
++                f"Unsupported markov_head_type: {mtp.get('markov_head_type')}"
++            )
++        return cls(
++            hidden_size=int(mtp["hidden_size"]),
++            num_hidden_layers=int(mtp["num_hidden_layers"]),
++            num_attention_heads=int(mtp["num_attention_heads"]),
++            num_key_value_heads=int(mtp["num_key_value_heads"]),
++            head_dim=int(mtp["head_dim"]),
++            intermediate_size=int(mtp["intermediate_size"]),
++            rms_norm_eps=float(mtp.get("rms_norm_eps", 1e-6)),
++            rope_theta=float(mtp.get("rope_theta", 1e6)),
++            sliding_window=int(mtp["sliding_window_size"]),
++            block_size=int(mtp["block_size"]),
++            markov_rank=int(mtp["markov_rank"]),
++            target_layer_ids=[int(i) for i in mtp["target_layer_ids"]],
++            vocab_size=int(text["vocab_size"]),
++            unpadded_vocab_size=int(
++                text.get("unpadded_vocab_size") or text["vocab_size"]
++            ),
++            final_logit_softcapping=float(text.get("final_logit_softcapping") or 0.0),
++        )
++
++
++def mix_rmsnorm(
++    context: mx.array, alpha: mx.array, weight: mx.array, eps: float
++) -> mx.array:
++    """Softmax-weighted mixture over captured target taps followed by RMSNorm."""
++    b, n, width = context.shape
++    taps = alpha.shape[0]
++    x = context.reshape(b, n, taps, width // taps).astype(mx.float32)
++    mixed = mx.sum(x * alpha.astype(mx.float32)[:, None], axis=2)
++    return mx.fast.rms_norm(mixed, weight.astype(mx.float32), eps).astype(context.dtype)
++
++
++class DraftAttention(nn.Module):
++    def __init__(self, config: Inkling2DSparkConfig):
++        super().__init__()
++        h = config.hidden_size
++        self.n_heads = config.num_attention_heads
++        self.n_kv_heads = config.num_key_value_heads
++        self.head_dim = config.head_dim
++        self.scale = self.head_dim**-0.5
++        dq = self.n_heads * self.head_dim
++        dkv = self.n_kv_heads * self.head_dim
++        self.dq = dq
++        self.dkv = dkv
++        self.q_proj = nn.Linear(h, dq, bias=False)
++        self.k_proj = nn.Linear(h, dkv, bias=False)
++        self.v_proj = nn.Linear(h, dkv, bias=False)
++        self.o_proj = nn.Linear(dq, h, bias=False)
++        self.k_proj_ctx = nn.Linear(h, dkv, bias=False)
++        self.v_proj_ctx = nn.Linear(h, dkv, bias=False)
++        self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
++        self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
++        self.k_norm_ctx = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
++        self._eps = config.rms_norm_eps
++        self._alpha: mx.array | None = None
++        self._mix_weight: mx.array | None = None
++
++    def project_context_kv(self, context: mx.array) -> tuple[mx.array, mx.array]:
++        mixed = mix_rmsnorm(context, self._alpha, self._mix_weight, self._eps)
++        if getattr(self, "_kv_ctx_proj", None) is not None:
++            return mx.split(self._kv_ctx_proj(mixed), 2, axis=-1)
++        return self.k_proj_ctx(mixed), self.v_proj_ctx(mixed)
++
++    def project_block_qkv(self, x: mx.array) -> tuple[mx.array, mx.array, mx.array]:
++        if getattr(self, "_qkv_proj", None) is not None:
++            return mx.split(
++                self._qkv_proj(x), (self.dq, self.dq + self.dkv), axis=-1
++            )
++        return self.q_proj(x), self.k_proj(x), self.v_proj(x)
++
++
++class DraftMLP(nn.Module):
++    def __init__(self, hidden: int, inter: int):
++        super().__init__()
++        self.gate_proj = nn.Linear(hidden, inter, bias=False)
++        self.up_proj = nn.Linear(hidden, inter, bias=False)
++        self.down_proj = nn.Linear(inter, hidden, bias=False)
++
++    def __call__(self, x: mx.array) -> mx.array:
++        if getattr(self, "_gate_up_proj", None) is not None:
++            g, u = mx.split(self._gate_up_proj(x), 2, axis=-1)
++            return self.down_proj(nn.silu(g) * u)
++        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
++
++
++class DraftLayer(nn.Module):
++    def __init__(self, config: Inkling2DSparkConfig):
++        super().__init__()
++        h = config.hidden_size
++        self.self_attn = DraftAttention(config)
++        self.mlp = DraftMLP(h, config.intermediate_size)
++        self.input_layernorm = nn.RMSNorm(h, eps=config.rms_norm_eps)
++        self.post_attention_layernorm = nn.RMSNorm(h, eps=config.rms_norm_eps)
++        self.dflare_norm = nn.RMSNorm(h, eps=config.rms_norm_eps)
++
++
++class Inkling2MarkovHead(nn.Module):
++    """Recurrent Markov transition head with folded LM head projection."""
++
++    def __init__(self, config: Inkling2DSparkConfig):
++        super().__init__()
++        r, h = config.markov_rank, config.hidden_size
++        self.rank = r
++        self.markov_w1 = nn.Embedding(config.vocab_size, r)
++        self.rnn_proj = nn.Linear(2 * r + 2 * h, 3 * r, bias=True)
++        self.hidden_out = nn.Linear(r, h, bias=True)
++        self.dflare_norm = nn.RMSNorm(h, eps=config.rms_norm_eps)
++        self._eps = config.rms_norm_eps
++        self._softcap = config.final_logit_softcapping
++        self._vocab_bias = None
++        if config.unpadded_vocab_size < config.vocab_size:
++            self._vocab_bias = mx.where(
++                mx.arange(config.vocab_size) < config.unpadded_vocab_size,
++                0.0,
++                -mx.inf,
++            ).astype(mx.float32)
++        self._fold_weight: mx.array | None = None
++        self._fold_qweight: mx.array | None = None
++        self._fold_scales: mx.array | None = None
++        self._fold_biases: mx.array | None = None
++        self._fold_bias: mx.array | None = None
++        self._alpha: mx.array | None = None
++
++    def fold(self, lm_head: nn.Module, quantize_fold: bool = True) -> None:
++        if isinstance(lm_head, nn.QuantizedLinear):
++            weight = mx.dequantize(
++                lm_head.weight,
++                lm_head.scales,
++                lm_head.get("biases"),
++                lm_head.group_size,
++                lm_head.bits,
++                mode=getattr(lm_head, "mode", "affine"),
++            )
++        else:
++            weight = lm_head.weight
++        proj = self.hidden_out.weight.astype(mx.float32)
++        bias = self.hidden_out.bias.astype(mx.float32)
++        target_dtype = (
++            lm_head.scales.dtype
++            if isinstance(lm_head, nn.QuantizedLinear)
++            else lm_head.weight.dtype
++        )
++        if target_dtype not in (mx.bfloat16, mx.float16):
++            target_dtype = mx.bfloat16
++        rows, biases = [], []
++        for start in range(0, weight.shape[0], 16384):
++            head = weight[start : start + 16384].astype(mx.float32)
++            rows.append((head @ proj).astype(target_dtype))
++            biases.append((head @ bias).astype(target_dtype))
++            mx.eval(rows[-1], biases[-1])
++        fold_w = mx.concatenate(rows, axis=0)
++        self._fold_bias = mx.concatenate(biases, axis=0)
++        if quantize_fold:
++            self._fold_qweight, self._fold_scales, self._fold_biases = mx.quantize(
++                fold_w, group_size=64, bits=4, mode="affine"
++            )
++            self._fold_weight = None
++            mx.eval(
++                self._fold_qweight,
++                self._fold_scales,
++                self._fold_biases,
++                self._fold_bias,
++            )
++        else:
++            self._fold_weight = fold_w
++            self._fold_qweight = self._fold_scales = self._fold_biases = None
++            mx.eval(self._fold_weight, self._fold_bias)
++
++    def context_feature(self, last_tap: mx.array) -> mx.array:
++        return mix_rmsnorm(last_tap, self._alpha, self.dflare_norm.weight, self._eps)[0]
++
++    def _finalize_logits(self, logits: mx.array) -> mx.array:
++        if self._softcap:
++            logits = mx.tanh(logits / self._softcap) * self._softcap
++        if self._vocab_bias is not None:
++            logits = logits + self._vocab_bias
++        return logits
++
++    def draft_depth1(
++        self,
++        lm_head_fn: Any,
++        prev_token: mx.array,
++        hidden_row: mx.array,
++        f_rnn: mx.array,
++    ) -> mx.array:
++        """Exact linearity fusion for depth=1: lm_head(h + hidden_out(latent)) in 1 LM-head pass."""
++        dtype = hidden_row.dtype
++        inputs = mx.concatenate(
++            [
++                mx.zeros((1, self.rank), dtype=dtype),
++                self.markov_w1(prev_token.reshape(-1)).astype(dtype),
++                hidden_row.astype(dtype),
++                f_rnn.astype(dtype),
++            ],
++            axis=-1,
++        )
++        proj = self.rnn_proj(inputs).astype(mx.float32)
++        latent = mx.tanh(proj[:, 2 * self.rank :]).astype(dtype)
++        h_eff = (hidden_row + self.hidden_out(latent)).astype(dtype)[:, None, :]
++        logits = lm_head_fn(h_eff)[:, 0].astype(mx.float32)
++        return mx.argmax(self._finalize_logits(logits), axis=-1)
++
++    def step_logits(
++        self,
++        base_logits: mx.array,
++        prev_token: mx.array,
++        state: mx.array,
++        hidden_row: mx.array,
++        f_rnn: mx.array,
++    ) -> tuple[mx.array, mx.array]:
++        dtype = state.dtype
++        inputs = mx.concatenate(
++            [
++                state,
++                self.markov_w1(prev_token.reshape(-1)).astype(dtype),
++                hidden_row.astype(dtype),
++                f_rnn.astype(dtype),
++            ],
++            axis=-1,
++        )
++        proj = self.rnn_proj(inputs).astype(mx.float32)
++        r = self.rank
++        gate = mx.sigmoid(proj[:, :r]).astype(dtype)
++        new_state = (gate * state).astype(dtype) + (
++            (1.0 - gate) * mx.tanh(proj[:, r : 2 * r]).astype(dtype)
++        ).astype(dtype)
++        latent = mx.tanh(proj[:, 2 * r :]).astype(dtype)
++        if self._fold_qweight is not None:
++            bias = (
++                mx.quantized_matmul(
++                    latent,
++                    self._fold_qweight,
++                    self._fold_scales,
++                    self._fold_biases,
++                    transpose=True,
++                    group_size=64,
++                    bits=4,
++                    mode="affine",
++                )
++                + self._fold_bias
++            )
++        else:
++            bias = latent @ self._fold_weight.T + self._fold_bias
++        logits = base_logits.astype(mx.float32) + bias.astype(mx.float32)
++        return self._finalize_logits(logits), new_state
++
++
++class Inkling2DSparkModel(nn.Module):
++    def __init__(self, config: Inkling2DSparkConfig):
++        super().__init__()
++        self.config = config
++        self.layers = [DraftLayer(config) for _ in range(config.num_hidden_layers)]
++        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.mask_embed = mx.zeros((config.hidden_size,))
++        self.fuse_weight = mx.zeros(
++            (config.num_hidden_layers + 1, len(config.target_layer_ids))
++        )
++        self.markov_head = Inkling2MarkovHead(config)
++        self.rope = nn.RoPE(config.head_dim, traditional=False, base=config.rope_theta)
++        self._embed_fn = None
++        self._lm_head_fn = None
++
++    def bind(
++        self, target: nn.Module, quantize_fold: bool = True
++    ) -> Inkling2DSparkModel:
++        self._embed_fn = target.model.language_model.embed
++        self._lm_head_fn = target.lm_head
++        target_dtype = target.model.language_model.embed_norm.weight.dtype
++        if target_dtype not in (mx.bfloat16, mx.float16):
++            target_dtype = mx.bfloat16
++        alpha = mx.softmax(self.fuse_weight.astype(mx.float32), axis=-1).astype(
++            target_dtype
++        )
++        for index, layer in enumerate(self.layers):
++            layer.self_attn._alpha = alpha[index]
++            layer.self_attn._mix_weight = layer.dflare_norm.weight
++        self.markov_head._alpha = alpha[-1]
++        self.markov_head.fold(target.lm_head, quantize_fold=quantize_fold)
++        lazy = [layer.self_attn._alpha for layer in self.layers]
++        lazy.append(self.markov_head._alpha)
++        if self.markov_head._vocab_bias is not None:
++            lazy.append(self.markov_head._vocab_bias)
++        mx.eval(lazy)
++        return self
++
++    def fuse_projections(self) -> None:
++        for layer in self.layers:
++            attn = layer.self_attn
++            if getattr(attn, "_qkv_proj", None) is None:
++                fused = fuse_linears([attn.q_proj, attn.k_proj, attn.v_proj])
++                if fused is not None:
++                    attn._qkv_proj = fused
++                    del attn.q_proj, attn.k_proj, attn.v_proj
++            if getattr(attn, "_kv_ctx_proj", None) is None:
++                fused = fuse_linears([attn.k_proj_ctx, attn.v_proj_ctx])
++                if fused is not None:
++                    attn._kv_ctx_proj = fused
++                    del attn.k_proj_ctx, attn.v_proj_ctx
++            mlp = layer.mlp
++            if getattr(mlp, "_gate_up_proj", None) is None:
++                fused = fuse_linears([mlp.gate_proj, mlp.up_proj])
++                if fused is not None:
++                    mlp._gate_up_proj = fused
++                    del mlp.gate_proj, mlp.up_proj
++
++
++class Inkling2DSparkDrafter:
++    """Single-sequence DSpark MTP drafter with static-size context ring buffers."""
++
++    def __init__(
++        self,
++        model_path: Path | str,
++        target_model: nn.Module,
++        *,
++        draft_bits: int = 8,
++        opt_drafter: bool = True,
++    ):
++        model_path = Path(model_path)
++        config = Inkling2DSparkConfig.from_target_config(
++            json.loads((model_path / "config.json").read_text())
++        )
++        self.config = config
++        self.target_layer_ids = list(config.target_layer_ids)
++        self.block_size = config.block_size
++        self.max_depth = config.block_size - 1
++        self.ring_slots = config.sliding_window - 1
++        self.opt_drafter = opt_drafter
++
++        target_dtype = target_model.model.language_model.embed_norm.weight.dtype
++        if target_dtype not in (mx.bfloat16, mx.float16):
++            target_dtype = mx.bfloat16
++        self.dtype = target_dtype
++
++        draft_model = Inkling2DSparkModel(config)
++        weights = mx.load(str(model_path / DRAFT_FILENAME))
++        if target_dtype == mx.float16:
++            weights = {
++                k: (v.astype(mx.float16) if v.dtype == mx.bfloat16 else v)
++                for k, v in weights.items()
++            }
++        draft_model.load_weights(list(weights.items()), strict=True)
++        nn.quantize(
++            draft_model,
++            group_size=64,
++            bits=draft_bits,
++            class_predicate=lambda p, m: isinstance(m, nn.Linear)
++            and p.startswith("layers."),
++        )
++        if opt_drafter:
++            draft_model.fuse_projections()
++        mx.eval(draft_model.parameters())
++        draft_model.bind(target_model, quantize_fold=opt_drafter)
++        self.model = draft_model
++
++        self.reset()
++
++    def reset(self) -> None:
++        cfg = self.config
++        shape = (1, cfg.num_key_value_heads, self.ring_slots, cfg.head_dim)
++        self.ring_keys = [
++            mx.zeros(shape, dtype=self.dtype) for _ in range(cfg.num_hidden_layers)
++        ]
++        self.ring_values = [
++            mx.zeros(shape, dtype=self.dtype) for _ in range(cfg.num_hidden_layers)
++        ]
++        self.pos = mx.full((self.ring_slots,), -1, dtype=mx.int32)
++        self.fed = 0
++        self.f_rnn: mx.array | None = None
++        mx.eval(*self.ring_keys, *self.ring_values, self.pos)
++
++    def draft(
++        self,
++        new_taps: list[mx.array],
++        anchor: int,
++        depth: int,
++    ) -> mx.array:
++        """Ingest committed target taps ``[(1, n, H), ...]`` and draft ``depth`` tokens."""
++        assert 1 <= depth <= self.max_depth
++        model = self.model
++        cfg = self.config
++        ctx = mx.concatenate(new_taps, axis=-1)
++        n_total = int(ctx.shape[1])
++        skip = max(0, n_total - self.ring_slots)
++        if skip:
++            ctx = ctx[:, skip:]
++        n = int(ctx.shape[1])
++        base = self.fed + skip
++        total = base + n
++        self.fed = total
++
++        if n > 0:
++            self.f_rnn = model.markov_head.context_feature(ctx[:, -1:])
++            write_slots = (
++                mx.arange(base, base + n, dtype=mx.int32) % self.ring_slots
++            )
++            self.pos[write_slots] = mx.arange(base, base + n, dtype=mx.int32)
++
++        ring_valid = (
++            (self.pos >= 0)
++            & (self.pos >= total - self.ring_slots)
++            & (self.pos < total)
++        )
++        mask = mx.concatenate(
++            [ring_valid, mx.ones((self.block_size,), dtype=mx.bool_)], axis=0
++        )[None, None, None, :]
++
++        anchor_arr = mx.array([[anchor]], dtype=mx.int32)
++        anchor_emb = model._embed_fn(anchor_arr)
++        masks_emb = mx.broadcast_to(
++            model.mask_embed.astype(anchor_emb.dtype),
++            (1, self.block_size - 1, cfg.hidden_size),
++        )
++        h = mx.concatenate([anchor_emb, masks_emb], axis=1)
++
++        for layer_idx, layer in enumerate(model.layers):
++            attn = layer.self_attn
++            residual = h
++            x = layer.input_layernorm(h)
++
++            q, prop_k, prop_v = attn.project_block_qkv(x)
++
++            if n > 0:
++                ctx_k, ctx_v = attn.project_context_kv(ctx)
++                ctx_k = attn.k_norm_ctx(
++                    ctx_k.reshape(1, n, attn.n_kv_heads, attn.head_dim)
++                ).transpose(0, 2, 1, 3)
++                ctx_v = ctx_v.reshape(1, n, attn.n_kv_heads, attn.head_dim).transpose(
++                    0, 2, 1, 3
++                )
++                ctx_k = model.rope(ctx_k, offset=base)
++                self.ring_keys[layer_idx][:, :, write_slots, :] = ctx_k
++                self.ring_values[layer_idx][:, :, write_slots, :] = ctx_v
++
++            q = attn.q_norm(
++                q.reshape(1, self.block_size, attn.n_heads, attn.head_dim)
++            ).transpose(0, 2, 1, 3)
++            prop_k = attn.k_norm(
++                prop_k.reshape(1, self.block_size, attn.n_kv_heads, attn.head_dim)
++            ).transpose(0, 2, 1, 3)
++            prop_v = prop_v.reshape(
++                1, self.block_size, attn.n_kv_heads, attn.head_dim
++            ).transpose(0, 2, 1, 3)
++
++            q = model.rope(q, offset=total)
++            prop_k = model.rope(prop_k, offset=total)
++
++            keys = mx.concatenate([self.ring_keys[layer_idx], prop_k], axis=2)
++            values = mx.concatenate([self.ring_values[layer_idx], prop_v], axis=2)
++            attended = mx.fast.scaled_dot_product_attention(
++                q, keys, values, scale=attn.scale, mask=mask
++            )
++            attended = attended.transpose(0, 2, 1, 3).reshape(1, self.block_size, -1)
++            h = residual + attn.o_proj(attended)
++            h = h + layer.mlp(layer.post_attention_layernorm(h))
++
++        draft_hidden = model.norm(h)[:, 1 : 1 + depth]
++        prev = mx.array([anchor], dtype=mx.int32)
++        if depth == 1 and self.opt_drafter:
++            draft_tokens = model.markov_head.draft_depth1(
++                model._lm_head_fn, prev, draft_hidden[:, 0], self.f_rnn
++            ).astype(mx.int32)
++        else:
++            base_logits = model._lm_head_fn(draft_hidden)
++            state = mx.zeros((1, cfg.markov_rank), dtype=draft_hidden.dtype)
++            proposals = []
++            for step in range(depth):
++                step_logits, state = model.markov_head.step_logits(
++                    base_logits[:, step],
++                    prev,
++                    state,
++                    draft_hidden[:, step],
++                    self.f_rnn,
++                )
++                prev = mx.argmax(step_logits, axis=-1)
++                proposals.append(prev)
++            draft_tokens = mx.concatenate(proposals).astype(mx.int32)
++        mx.eval(draft_tokens, *self.ring_keys, *self.ring_values, self.pos, self.f_rnn)
++        return draft_tokens
++
++
++class AdaptiveMTPController:
++    """Adaptive MTP depth controller that backs off to d=0 on high-entropy spans
++    and ramps up to max_depth on predictable code / JSON / structured spans.
++    """
++
++    def __init__(
++        self,
++        max_depth: int = 2,
++        *,
++        ema_alpha: float = 0.25,
++        backoff_threshold: float = 0.42,
++        initial_cooldown: int = 12,
++        max_cooldown: int = 32,
++    ) -> None:
++        self.max_depth = max(0, int(max_depth))
++        self.ema_alpha = float(ema_alpha)
++        self.backoff_threshold = float(backoff_threshold)
++        self.initial_cooldown = int(initial_cooldown)
++        self.max_cooldown = int(max_cooldown)
++        self.reset()
++
++    def reset(self) -> None:
++        self.cur_depth = self.max_depth
++        self.ema_accept = 0.65
++        self.consec_zero = 0
++        self.consec_full = 0
++        self.cooldown_left = 0
++        self.cur_cooldown = self.initial_cooldown
++        self.probing = False
++
++    def next_depth(self, remaining_tokens: int) -> int:
++        if self.max_depth <= 0 or remaining_tokens <= 0:
++            return 0
++        if self.cooldown_left > 0:
++            self.cooldown_left -= 1
++            return 0
++        if self.probing:
++            return min(2, self.max_depth, remaining_tokens)
++        return min(self.cur_depth, remaining_tokens)
++
++    def observe(self, depth_used: int, accepted: int) -> None:
++        if depth_used <= 0:
++            return
++        rate = accepted / depth_used
++
++        if self.probing:
++            self.probing = False
++            if accepted >= 1:
++                self.cur_depth = min(2, self.max_depth)
++                self.ema_accept = max(self.ema_accept, 0.55)
++                self.consec_zero = 0
++                self.consec_full = 1 if accepted == depth_used else 0
++                self.cur_cooldown = self.initial_cooldown
++            else:
++                self.cooldown_left = self.cur_cooldown
++                self.cur_cooldown = min(self.max_cooldown, self.cur_cooldown * 2)
++                self.probing = True
++            return
++
++        self.ema_accept = (1.0 - self.ema_alpha) * self.ema_accept + self.ema_alpha * rate
++        if accepted == 0:
++            self.consec_zero += 1
++            self.consec_full = 0
++        else:
++            self.consec_zero = 0
++            if accepted == depth_used:
++                self.consec_full += 1
++            else:
++                self.consec_full = 0
++
++        if self.consec_zero >= 2 or self.ema_accept < self.backoff_threshold:
++            if self.cur_depth > 2:
++                self.cur_depth = max(2, self.cur_depth - 1)
++                self.consec_zero = 0
++            else:
++                self.cooldown_left = self.cur_cooldown
++                self.cur_cooldown = min(self.max_cooldown, self.cur_cooldown * 2)
++                self.probing = True
++                self.consec_zero = 0
++        elif self.consec_full >= 2 and self.cur_depth < self.max_depth:
++            self.cur_depth += 1
++            self.consec_full = 0
++
